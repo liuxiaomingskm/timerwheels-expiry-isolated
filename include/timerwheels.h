@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <type_traits>
@@ -85,7 +86,7 @@ namespace timerwheels {
 			std::uint64_t id;
 
 			Timer(move_only_function&& fire, DURATION&& repeat, DURATION&& when)
-				: fire(std::move(fire)), repeat(std::move(repeat)), next(nullptr), when(std::move(when)),
+				: next(nullptr), fire(std::move(fire)), repeat(std::move(repeat)), when(std::move(when)),
 				  remaining(0), counted(false), id(0) {}
 		};
 
@@ -106,11 +107,6 @@ namespace timerwheels {
 		 */
 		std::atomic<struct Timer*> unscheduled;
 
-		/**
-		 * @brief Number of live timers (each counted-rearm timer counts once).
-		 */
-		std::size_t live_count;
-
 		std::uint64_t next_ticket = 1;
 		std::unordered_set<ticket> live;
 		std::unordered_set<ticket> retired;
@@ -124,6 +120,11 @@ namespace timerwheels {
 		// fire body must not call tick() reentrantly; books is the lock that
 		// is never held across a fire body.
 		std::mutex tick_mu;
+
+		struct Timer* drain_cursor = nullptr;
+		std::size_t frontier_ticks_left = 0;
+		std::size_t frontier_ticks_total = 0;
+		bool frontier_active = false;
 
 		// Call only with books held. Never held across user fire bodies.
 		inline void release(struct Timer* timer) {
@@ -158,11 +159,78 @@ namespace timerwheels {
 		}
 
 		inline void queue(struct Timer* timer, std::atomic<struct Timer*>& onto) {
-			struct Timer* head = nullptr;
-			do {
-				head = onto.load(std::memory_order::memory_order_acq_rel);
-				timer->next.store(head, std::memory_order::memory_order_acq_rel);
-			} while (!onto.compare_exchange_weak(head, timer, std::memory_order::memory_order_acq_rel));
+		struct Timer* head = nullptr;
+		do {
+			head = onto.load(std::memory_order::memory_order_acquire);
+			timer->next.store(head, std::memory_order::memory_order_relaxed);
+		} while (!onto.compare_exchange_weak(head, timer,
+				std::memory_order::memory_order_release,
+				std::memory_order::memory_order_relaxed));
+		}
+
+		inline void integrate_unscheduled() {
+			for (
+				struct Timer * t = unscheduled.exchange(nullptr, std::memory_order::memory_order_acq_rel), * next = nullptr;
+				t != nullptr;
+				t = next) {
+				next = t->next.load(std::memory_order::memory_order_acquire);
+				{
+					std::lock_guard<std::mutex> guard(books);
+					if (retired.count(t->id) != 0) {
+						release(t);
+						continue;
+					}
+				}
+				schedule(t, t->when);
+			}
+		}
+
+		inline void finish_frontier() {
+			last_tick += frontier_ticks_total * DURATION(BUCKET);
+			frontier_ticks_left = 0;
+			frontier_ticks_total = 0;
+			frontier_active = false;
+			integrate_unscheduled();
+		}
+
+		inline bool prepare_due_timer() {
+			for (;;) {
+				while (drain_cursor != nullptr) {
+					std::lock_guard<std::mutex> guard(books);
+					if (retired.count(drain_cursor->id) == 0) {
+						return true;
+					}
+					struct Timer* retired_timer = drain_cursor;
+					drain_cursor = drain_cursor->next.load(std::memory_order::memory_order_acquire);
+					release(retired_timer);
+				}
+
+				if (frontier_ticks_left == 0) {
+					finish_frontier();
+					return false;
+				}
+
+				index = (index + 1) % (RANGE / BUCKET);
+				--frontier_ticks_left;
+				drain_cursor = wheel[index].exchange(nullptr, std::memory_order::memory_order_acq_rel);
+			}
+		}
+
+		inline void abort_frontier_after_throw() {
+			std::lock_guard<std::mutex> guard(books);
+			for (struct Timer* rest = drain_cursor; rest != nullptr;) {
+				struct Timer* next = rest->next.load(std::memory_order::memory_order_acquire);
+				if (retired.count(rest->id) != 0) {
+					release(rest);
+				} else {
+					queue(rest, wheel[(index + 1) % (RANGE / BUCKET)]);
+				}
+				rest = next;
+			}
+			drain_cursor = nullptr;
+			frontier_ticks_left = 0;
+			frontier_ticks_total = 0;
+			frontier_active = false;
 		}
 
 		/**
@@ -193,9 +261,19 @@ namespace timerwheels {
 		}
 
 	public:
-		FixedRangeTimerWheel() : last_tick(CLOCK::now()), index(0), unscheduled(nullptr), wheel {}, live_count(0) {}
+		struct tick_result {
+			std::size_t fired;
+			bool more_due;
+		};
+
+		FixedRangeTimerWheel() : wheel {}, index(0), last_tick(CLOCK::now()), unscheduled(nullptr) {}
 
 		~FixedRangeTimerWheel() {
+			for (struct Timer* cur = drain_cursor, *nxt = nullptr;
+			     cur != nullptr; cur = nxt) {
+				nxt = cur->next.load(std::memory_order::memory_order_acquire);
+				delete cur;
+			}
 			for (std::size_t b = 0; b < RANGE / BUCKET; ++b) {
 				for (struct Timer* cur = wheel[b].exchange(nullptr,
 						std::memory_order::memory_order_acq_rel), *nxt = nullptr;
@@ -239,7 +317,6 @@ namespace timerwheels {
 				live.insert(timer->id);
 			}
 			queue(timer, unscheduled);
-			++live_count;
 			return timer->id;
 		}
 
@@ -266,7 +343,6 @@ namespace timerwheels {
 				live.insert(timer->id);
 			}
 			queue(timer, unscheduled);
-			++live_count;
 			return timer->id;
 		}
 
@@ -342,91 +418,73 @@ namespace timerwheels {
 		 * @brief Do any outstanding work
 		 * @details Fire any timers that have elapsed, and schedule any unscheduled timers.
 		 */
-		void tick() {
+		tick_result tick(std::size_t budget) {
 			std::lock_guard<std::mutex> tick_guard(tick_mu);
-			auto now = CLOCK::now();
+			if (budget == 0) {
+				return {0, frontier_active};
+			}
 
-			// advance wheel and fire any timers
-			std::size_t ticks_to_advance = std::min<std::size_t>((now - last_tick) / DURATION(BUCKET), RANGE / BUCKET);
-			for (std::size_t i = 1; i <= ticks_to_advance; ++i) {
-				index = ++index % (RANGE / BUCKET);
-				for (
-					struct Timer * t = wheel[index].exchange(nullptr, std::memory_order::memory_order_acq_rel), * next = nullptr;
-					t != nullptr;
-					t = next) {
-					next = t->next.load(std::memory_order::memory_order_acq_rel);
-					{
-						std::lock_guard<std::mutex> guard(books);
-						if (retired.count(t->id) != 0) {
-							release(t);
-							continue;
-						}
-						firing = t->id;
-					}
-					try {
-						t->fire();
-					} catch (...) {
-						// a throwing fire body consumes its timer: no rearm,
-						// no leak; the exception keeps travelling and the
-						// wheel stays usable. Timers in this bucket whose turn
-						// had not come stay queued and go off on the next
-						// advancing tick, unless dropped in the meantime.
-						std::lock_guard<std::mutex> guard(books);
-						firing = 0;
-						for (struct Timer* r = next; r != nullptr;) {
-							struct Timer* rn = r->next.load(std::memory_order::memory_order_acquire);
-							if (retired.count(r->id) != 0) {
-								release(r);
-							} else {
-								queue(r, wheel[(index + 1) % (RANGE / BUCKET)]);
-							}
-							r = rn;
-						}
-						release(t);
-						throw;
-					}
-					{
-						std::lock_guard<std::mutex> guard(books);
-						firing = 0;
-						if (retired.count(t->id) != 0) {
-							// dropped from inside its own firing: no rearm.
-							release(t);
-							continue;
-						}
-
-						// clean-up or reschedule
-						if (t->counted) {
-							if (--(t->remaining) == 0) {
-								release(t);
-							} else {
-								schedule(t, t->repeat);
-							}
-						} else if (t->repeat == DURATION::zero()) {
-							release(t);
-						} else {
-							schedule(t, t->repeat);
-						}
-					}
+			if (!frontier_active) {
+				auto now = CLOCK::now();
+				frontier_ticks_total = std::min<std::size_t>(
+					(now - last_tick) / DURATION(BUCKET), RANGE / BUCKET);
+				frontier_ticks_left = frontier_ticks_total;
+				frontier_active = frontier_ticks_total != 0;
+				if (!frontier_active) {
+					integrate_unscheduled();
+					return {0, false};
 				}
 			}
 
-			last_tick += ticks_to_advance * DURATION(BUCKET);
-
-			// schedule any timers added by other threads
-			for (
-				struct Timer * t = unscheduled.exchange(nullptr, std::memory_order::memory_order_acq_rel), * next = nullptr;
-				t != nullptr;
-				t = next) {
-				next = t->next.load(std::memory_order::memory_order_acq_rel);
+			std::size_t fired_count = 0;
+			while (fired_count < budget && prepare_due_timer()) {
+				struct Timer* t = drain_cursor;
+				drain_cursor = t->next.load(std::memory_order::memory_order_acquire);
 				{
 					std::lock_guard<std::mutex> guard(books);
+					firing = t->id;
+				}
+
+				try {
+					t->fire();
+					++fired_count;
+				} catch (...) {
+					{
+						std::lock_guard<std::mutex> guard(books);
+						firing = 0;
+						release(t);
+					}
+					abort_frontier_after_throw();
+					throw;
+				}
+
+				{
+					std::lock_guard<std::mutex> guard(books);
+					firing = 0;
 					if (retired.count(t->id) != 0) {
 						release(t);
 						continue;
 					}
+					if (t->counted) {
+						if (--(t->remaining) == 0) {
+							release(t);
+						} else {
+							schedule(t, t->repeat);
+						}
+					} else if (t->repeat == DURATION::zero()) {
+						release(t);
+					} else {
+						schedule(t, t->repeat);
+					}
 				}
-				schedule(t, t->when);
 			}
+
+			bool more = frontier_active && prepare_due_timer();
+			return {fired_count, more};
+		}
+
+		void tick() {
+			(void)tick(std::numeric_limits<std::size_t>::max());
 		}
 	};
 }
